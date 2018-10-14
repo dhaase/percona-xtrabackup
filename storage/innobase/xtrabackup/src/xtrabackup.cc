@@ -1,6 +1,6 @@
 /******************************************************
 XtraBackup: hot backup tool for InnoDB
-(c) 2009-2015 Percona LLC and/or its affiliates
+(c) 2009-2017 Percona LLC and/or its affiliates
 Originally Created 3/3/2009 Yasufumi Kinoshita
 Written by Alexey Kopytov, Aleksandr Kuzminsky, Stewart Smith, Vadim Tkachenko,
 Yasufumi Kinoshita, Ignacio Nin and Baron Schwartz.
@@ -67,6 +67,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <srv0start.h>
 #include <buf0dblwr.h>
 
+#include <list>
 #include <sstream>
 #include <set>
 #include <mysql.h>
@@ -91,6 +92,10 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "backup_mysql.h"
 #include "backup_copy.h"
 #include "backup_mysql.h"
+#include "ds_encrypt.h"
+#include "xbcrypt_common.h"
+#include "crc_glue.h"
+#include "xtrabackup_config.h"
 
 /* TODO: replace with appropriate macros used in InnoDB 5.6 */
 #define PAGE_ZIP_MIN_SIZE_SHIFT	10
@@ -142,23 +147,21 @@ char xtrabackup_real_incremental_dir[FN_REFLEN];
 lsn_t xtrabackup_archived_to_lsn = 0; /* for --archived-to-lsn */
 
 char *xtrabackup_tables = NULL;
-
-/* List of regular expressions for filtering */
-typedef struct xb_regex_list_node_struct xb_regex_list_node_t;
-struct xb_regex_list_node_struct {
-	UT_LIST_NODE_T(xb_regex_list_node_t)	regex_list;
-	xb_regex_t				regex;
-};
-static UT_LIST_BASE_NODE_T(xb_regex_list_node_t) regex_list;
-
-static xb_regmatch_t tables_regmatch[1];
-
 char *xtrabackup_tables_file = NULL;
-static hash_table_t* tables_hash = NULL;
+char *xtrabackup_tables_exclude = NULL;
+
+typedef std::list<xb_regex_t> regex_list_t;
+static regex_list_t regex_include_list;
+static regex_list_t regex_exclude_list;
+
+static hash_table_t* tables_include_hash = NULL;
+static hash_table_t* tables_exclude_hash = NULL;
 
 char *xtrabackup_databases = NULL;
 char *xtrabackup_databases_file = NULL;
-static hash_table_t* databases_hash = NULL;
+char *xtrabackup_databases_exclude = NULL;
+static hash_table_t* databases_include_hash = NULL;
+static hash_table_t* databases_exclude_hash = NULL;
 
 static hash_table_t* inc_dir_tables_hash;
 
@@ -301,6 +304,7 @@ static char *xtrabackup_debug_sync = NULL;
 
 my_bool xtrabackup_compact = FALSE;
 my_bool xtrabackup_rebuild_indexes = FALSE;
+my_bool xtrabackup_compact_need_expand = FALSE;
 
 my_bool xtrabackup_incremental_force_scan = FALSE;
 
@@ -332,6 +336,7 @@ static longlong	innobase_log_file_size_save;
 /* String buffer used by --print-param to accumulate server options as they are
 parsed from the defaults file */
 static std::ostringstream print_param_str;
+static std::ostringstream param_str;
 
 /* Set of specified parameters */
 std::set<std::string> param_set;
@@ -346,10 +351,13 @@ my_bool opt_no_lock = FALSE;
 my_bool opt_safe_slave_backup = FALSE;
 my_bool opt_rsync = FALSE;
 my_bool opt_force_non_empty_dirs = FALSE;
+#ifdef HAVE_VERSION_CHECK
 my_bool opt_noversioncheck = FALSE;
+#endif
 my_bool opt_no_backup_locks = FALSE;
 my_bool opt_decompress = FALSE;
 my_bool opt_remove_original = FALSE;
+static my_bool opt_check_privileges = FALSE;
 
 static const char *binlog_info_values[] = {"off", "lockless", "on", "auto",
 					   NullS};
@@ -387,6 +395,7 @@ uint opt_safe_slave_backup_timeout = 0;
 
 const char *opt_history = NULL;
 my_bool opt_decrypt = FALSE;
+uint opt_read_buffer_size = 0;
 
 #if defined(HAVE_OPENSSL)
 my_bool opt_ssl_verify_server_cert = FALSE;
@@ -394,6 +403,9 @@ my_bool opt_ssl_verify_server_cert = FALSE;
 char *opt_server_public_key = NULL;
 #endif
 #endif
+
+static void
+check_all_privileges();
 
 /* Whether xtrabackup_binlog_info should be created on recovery */
 static bool recover_binlog_info;
@@ -585,7 +597,9 @@ enum options_xtrabackup
   OPT_SAFE_SLAVE_BACKUP,
   OPT_RSYNC,
   OPT_FORCE_NON_EMPTY_DIRS,
+#ifdef HAVE_VERSION_CHECK
   OPT_NO_VERSION_CHECK,
+#endif
   OPT_NO_BACKUP_LOCKS,
   OPT_DECOMPRESS,
   OPT_INCREMENTAL_HISTORY_NAME,
@@ -607,6 +621,10 @@ enum options_xtrabackup
   OPT_SSL_VERIFY_SERVER_CERT,
   OPT_SERVER_PUBLIC_KEY,
 
+  OPT_XTRA_TABLES_EXCLUDE,
+  OPT_XTRA_DATABASES_EXCLUDE,
+  OPT_XTRA_CHECK_PRIVILEGES,
+  OPT_XTRA_READ_BUFFER_SIZE,
 };
 
 struct my_option xb_client_options[] =
@@ -677,6 +695,16 @@ struct my_option xb_client_options[] =
    "filtering by list of databases in the file.",
    (G_PTR*) &xtrabackup_databases_file, (G_PTR*) &xtrabackup_databases_file,
    0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"tables-exclude", OPT_XTRA_TABLES_EXCLUDE, "filtering by regexp for table names. "
+  "Operates the same way as --tables, but matched names are excluded from backup. "
+  "Note that this option has a higher priority than --tables.",
+    (G_PTR*) &xtrabackup_tables_exclude, (G_PTR*) &xtrabackup_tables_exclude,
+    0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"databases-exclude", OPT_XTRA_DATABASES_EXCLUDE, "Excluding databases based on name, "
+  "Operates the same way as --databases, but matched names are excluded from backup. "
+  "Note that this option has a higher priority than --databases.",
+    (G_PTR*) &xtrabackup_databases_exclude, (G_PTR*) &xtrabackup_databases_exclude,
+    0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   {"create-ib-logfile", OPT_XTRA_CREATE_IB_LOGFILE, "** not work for now** creates ib_logfile* also after '--prepare'. ### If you want create ib_logfile*, only re-execute this command in same options. ###",
    (G_PTR*) &xtrabackup_create_ib_logfile, (G_PTR*) &xtrabackup_create_ib_logfile,
    0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
@@ -836,11 +864,13 @@ struct my_option xb_client_options[] =
    (uchar *) &opt_force_non_empty_dirs,
    0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
 
+#ifdef HAVE_VERSION_CHECK
   {"no-version-check", OPT_NO_VERSION_CHECK, "This option disables the "
    "version check which is enabled by the --version-check option.",
    (uchar *) &opt_noversioncheck,
    (uchar *) &opt_noversioncheck,
    0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+#endif
 
   {"no-backup-locks", OPT_NO_BACKUP_LOCKS, "This option controls if "
    "backup locks should be used instead of FLUSH TABLES WITH READ LOCK "
@@ -999,6 +1029,19 @@ struct my_option xb_client_options[] =
     " uses old (pre-4.1.1) protocol.", &opt_secure_auth,
     &opt_secure_auth, 0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0},
 
+  {"check-privileges", OPT_XTRA_CHECK_PRIVILEGES, "Check database user "
+    "privileges before performing any query.", &opt_check_privileges,
+   &opt_check_privileges, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+
+  {"read_buffer_size",
+   OPT_XTRA_READ_BUFFER_SIZE,
+   "Set datafile read buffer size, given value is scaled up to page size."
+   " Default is 10Mb.",
+   &opt_read_buffer_size,
+   &opt_read_buffer_size,
+   0, GET_UINT, OPT_ARG, 10*1024*1024,
+   UNIV_PAGE_SIZE_MAX, UINT_MAX, 0, UNIV_PAGE_SIZE_MAX, 0},
+
 #include "sslopt-longopts.h"
 
 #if !defined(HAVE_YASSL)
@@ -1028,8 +1071,8 @@ struct my_option xb_server_options[] =
    (G_PTR*) &opt_mysql_tmpdir,
    (G_PTR*) &opt_mysql_tmpdir, 0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   {"parallel", OPT_XTRA_PARALLEL,
-   "Number of threads to use for parallel datafiles transfer. Does not have "
-   "any effect in the stream mode. The default value is 1.",
+   "Number of threads to use for parallel datafiles transfer. "
+   "The default value is 1.",
    (G_PTR*) &xtrabackup_parallel, (G_PTR*) &xtrabackup_parallel, 0, GET_INT,
    REQUIRED_ARG, 1, 1, INT_MAX, 0, 0, 0},
 
@@ -1325,9 +1368,27 @@ check_if_param_set(const char *param)
 
 my_bool
 xb_get_one_option(int optid,
-		  const struct my_option *opt __attribute__((unused)),
+		  const struct my_option *opt,
 		  char *argument)
 {
+  static const char* hide_value[]=
+    { "password", "encrypt-key", "transition-key" };
+
+  param_str << "--" << opt->name;
+  if (argument) {
+    bool param_handled = false;
+    for (unsigned i=0; i<sizeof(hide_value)/sizeof(char*); ++i) {
+      if (strcmp(opt->name, hide_value[i]) == 0) {
+        param_handled = true;
+        param_str << "=*";
+        break;
+      }
+    }
+    if(!param_handled) {
+      param_str << "=" << argument;
+    }
+  }
+  param_str << " ";
   switch(optid) {
   case 'h':
     strmake(mysql_real_data_home,argument, FN_REFLEN - 1);
@@ -1948,9 +2009,11 @@ xtrabackup_read_metadata(char *filename)
 	/* Optional fields */
 
 	if (fscanf(fp, "compact = %d\n", &t) == 1) {
-		xtrabackup_compact = (t == 1);
+		xtrabackup_compact = (t != 0);
+		xtrabackup_compact_need_expand = (t == 1);
 	} else {
-		xtrabackup_compact = 0;
+		xtrabackup_compact = FALSE;
+		xtrabackup_compact_need_expand = FALSE;
 	}
 
 	if (fscanf(fp, "recover_binlog_info = %d\n", &t) == 1) {
@@ -1981,7 +2044,11 @@ xtrabackup_print_metadata(char *buf, size_t buf_len)
 		 metadata_from_lsn,
 		 metadata_to_lsn,
 		 metadata_last_lsn,
-		 MY_TEST(xtrabackup_compact == TRUE),
+		 /* compact = 1 means backup is compact, not expanded
+		    compact = 2 means backup is compact, expanded */
+		 xtrabackup_compact ?
+			(xtrabackup_backup ||
+				xtrabackup_compact_need_expand ? 1 : 2) : 0,
 		 MY_TEST(opt_binlog_info == BINLOG_INFO_LOCKLESS));
 }
 
@@ -2023,6 +2090,26 @@ xtrabackup_stream_metadata(ds_ctxt_t *ds_ctxt)
 	return(rc);
 }
 
+
+static
+my_bool write_to_file(const char *filepath, const char *data)
+{
+	size_t len = strlen(data);
+	FILE *fp = fopen(filepath, "w");
+	if(!fp) {
+		msg("xtrabackup: Error: cannot open %s\n", filepath);
+		return(FALSE);
+	}
+	if (fwrite(data, len, 1, fp) < 1) {
+		fclose(fp);
+		return(FALSE);
+	}
+
+	fclose(fp);
+	return TRUE;
+}
+
+
 /***********************************************************************
 Write backup meta info to a specified file.
 @return TRUE on success, FALSE on failure. */
@@ -2031,26 +2118,9 @@ my_bool
 xtrabackup_write_metadata(const char *filepath)
 {
 	char		buf[1024];
-	size_t		len;
-	FILE		*fp;
 
 	xtrabackup_print_metadata(buf, sizeof(buf));
-
-	len = strlen(buf);
-
-	fp = fopen(filepath, "w");
-	if(!fp) {
-		msg("xtrabackup: Error: cannot open %s\n", filepath);
-		return(FALSE);
-	}
-	if (fwrite(buf, len, 1, fp) < 1) {
-		fclose(fp);
-		return(FALSE);
-	}
-
-	fclose(fp);
-
-	return(TRUE);
+	return write_to_file(filepath, buf);
 }
 
 /***********************************************************************
@@ -2140,6 +2210,20 @@ xb_write_delta_metadata(const char *filename, const xb_delta_info_t *info)
 	return(ret);
 }
 
+static my_bool
+xtrabackup_write_info(const char *filepath)
+{
+	char *xtrabackup_info_data = get_xtrabackup_info(mysql_connection);
+	if (!xtrabackup_info_data) {
+		return FALSE;
+	}
+
+	my_bool result = write_to_file(filepath, xtrabackup_info_data);
+
+	free(xtrabackup_info_data);
+	return result;
+}
+
 /* ================= backup ================= */
 void
 xtrabackup_io_throttling(void)
@@ -2150,43 +2234,139 @@ xtrabackup_io_throttling(void)
 	}
 }
 
-/************************************************************************
-Checks if a given table name matches any of specifications in the --tables or
---tables-file options.
-
-@return TRUE on match. */
-static my_bool
-check_if_table_matches_filters(const char *name)
+static
+my_bool regex_list_check_match(
+	const regex_list_t& list,
+	const char* name)
 {
-	int 			regres;
-	xb_filter_entry_t*	table;
-	xb_regex_list_node_t*	node;
+	xb_regmatch_t tables_regmatch[1];
+	for (regex_list_t::const_iterator i = list.begin(), end = list.end();
+	     i != end; ++i) {
+		const xb_regex_t& regex = *i;
+		int regres = xb_regexec(&regex, name, 1, tables_regmatch, 0);
 
-	if (UT_LIST_GET_LEN(regex_list)) {
-		/* Check against regular expressions list */
-		for (node = UT_LIST_GET_FIRST(regex_list); node;
-		     node = UT_LIST_GET_NEXT(regex_list, node)) {
-			regres = xb_regexec(&node->regex, name, 1,
-					    tables_regmatch, 0);
-			if (regres != REG_NOMATCH) {
-
-				return(TRUE);
-			}
-		}
-	}
-
-	if (tables_hash) {
-		HASH_SEARCH(name_hash, tables_hash, ut_fold_string(name),
-			    xb_filter_entry_t*,
-			    table, (void) 0,
-			    !strcmp(table->name, name));
-		if (table) {
-
+		if (regres != REG_NOMATCH) {
 			return(TRUE);
 		}
 	}
-
 	return(FALSE);
+}
+
+static
+my_bool
+find_filter_in_hashtable(
+	const char* name,
+	hash_table_t* table,
+	xb_filter_entry_t** result
+)
+{
+	xb_filter_entry_t* found = NULL;
+	HASH_SEARCH(name_hash, table, ut_fold_string(name),
+		    xb_filter_entry_t*,
+		    found, (void) 0,
+		    !strcmp(found->name, name));
+
+	if (found && result) {
+		*result = found;
+	}
+	return (found != NULL);
+}
+
+/************************************************************************
+Checks if a given table name matches any of specifications given in
+regex_list or tables_hash.
+
+@return TRUE on match or both regex_list and tables_hash are empty.*/
+static my_bool
+check_if_table_matches_filters(const char *name,
+	const regex_list_t& regex_list,
+	hash_table_t* tables_hash)
+{
+	if (regex_list.empty() && !tables_hash) {
+		return(FALSE);
+	}
+
+	if (regex_list_check_match(regex_list, name)) {
+		return(TRUE);
+	}
+
+	if (tables_hash && find_filter_in_hashtable(name, tables_hash, NULL)) {
+		return(TRUE);
+	}
+
+	return FALSE;
+}
+
+enum skip_database_check_result {
+	DATABASE_SKIP,
+	DATABASE_SKIP_SOME_TABLES,
+	DATABASE_DONT_SKIP,
+	DATABASE_DONT_SKIP_UNLESS_EXPLICITLY_EXCLUDED,
+};
+
+/************************************************************************
+Checks if a database specified by name should be skipped from backup based on
+the --databases, --databases_file or --databases_exclude options.
+
+@return TRUE if entire database should be skipped,
+	FALSE otherwise.
+*/
+static
+skip_database_check_result
+check_if_skip_database(
+	const char* name  /*!< in: path to the database */
+)
+{
+	/* There are some filters for databases, check them */
+	xb_filter_entry_t*	database = NULL;
+
+	if (databases_exclude_hash &&
+		find_filter_in_hashtable(name, databases_exclude_hash,
+					 &database) &&
+		!database->has_tables) {
+		/* Database is found and there are no tables specified,
+		   skip entire db. */
+		return DATABASE_SKIP;
+	}
+
+	if (databases_include_hash) {
+		if (!find_filter_in_hashtable(name, databases_include_hash,
+					      &database)) {
+		/* Database isn't found, skip the database */
+			return DATABASE_SKIP;
+		} else if (database->has_tables) {
+			return DATABASE_SKIP_SOME_TABLES;
+		} else {
+			return DATABASE_DONT_SKIP_UNLESS_EXPLICITLY_EXCLUDED;
+		}
+	}
+
+	return DATABASE_DONT_SKIP;
+}
+
+/************************************************************************
+Checks if a database specified by path should be skipped from backup based on
+the --databases, --databases_file or --databases_exclude options.
+
+@return TRUE if the table should be skipped. */
+my_bool
+check_if_skip_database_by_path(
+	const char* path /*!< in: path to the db directory. */
+)
+{
+	if (databases_include_hash == NULL &&
+		databases_exclude_hash == NULL) {
+		return(FALSE);
+	}
+
+	const char* db_name = strrchr(path, SRV_PATH_SEPARATOR);
+	if (db_name == NULL) {
+		db_name = path;
+	} else {
+		++db_name;
+	}
+
+	return check_if_skip_database(db_name) == DATABASE_SKIP;
 }
 
 /************************************************************************
@@ -2205,9 +2385,12 @@ check_if_skip_table(
 	const char *ptr;
 	char *eptr;
 
-	if (UT_LIST_GET_LEN(regex_list) == 0 &&
-	    tables_hash == NULL &&
-	    databases_hash == NULL) {
+	if (regex_exclude_list.empty() &&
+		regex_include_list.empty() &&
+		tables_include_hash == NULL &&
+		tables_exclude_hash == NULL &&
+		databases_include_hash == NULL &&
+		databases_exclude_hash == NULL) {
 		return(FALSE);
 	}
 
@@ -2225,23 +2408,10 @@ check_if_skip_table(
 	strncpy(buf, dbname, FN_REFLEN);
 	buf[tbname - 1 - dbname] = 0;
 
-	if (databases_hash) {
-		/* There are some filters for databases, check them */
-		xb_filter_entry_t*	database;
-
-		HASH_SEARCH(name_hash, databases_hash, ut_fold_string(buf),
-			    xb_filter_entry_t*,
-			    database, (void) 0,
-			    !strcmp(database->name, buf));
-		/* Table's database isn't found, skip the table */
-		if (!database) {
-			return(TRUE);
-		}
-		/* There aren't tables specified for the database,
-		it should be backed up entirely */
-		if (!database->has_tables) {
-			return(FALSE);
-		}
+	const skip_database_check_result skip_database =
+			check_if_skip_database(buf);
+	if (skip_database == DATABASE_SKIP) {
+		return (TRUE);
 	}
 
 	buf[FN_REFLEN - 1] = '\0';
@@ -2258,21 +2428,43 @@ check_if_skip_table(
 	/* For partitioned tables first try to match against the regexp
 	without truncating the #P#... suffix so we can backup individual
 	partitions with regexps like '^test[.]t#P#p5' */
-	if (check_if_table_matches_filters(buf)) {
-
+	if (check_if_table_matches_filters(buf, regex_exclude_list,
+					   tables_exclude_hash)) {
+		return(TRUE);
+	}
+	if (check_if_table_matches_filters(buf, regex_include_list,
+					   tables_include_hash)) {
 		return(FALSE);
 	}
 	if ((eptr = strstr(buf, "#P#")) != NULL) {
-
 		*eptr = 0;
 
-		if (check_if_table_matches_filters(buf)) {
-
+		if (check_if_table_matches_filters(buf, regex_exclude_list,
+						   tables_exclude_hash)) {
+			return (TRUE);
+		}
+		if (check_if_table_matches_filters(buf, regex_include_list,
+						   tables_include_hash)) {
 			return(FALSE);
 		}
 	}
 
-	return(TRUE);
+	if (skip_database == DATABASE_DONT_SKIP_UNLESS_EXPLICITLY_EXCLUDED) {
+		/* Database is in include-list, and qualified name wasn't
+		   found in any of exclusion filters.*/
+		return (FALSE);
+	}
+
+	if (skip_database == DATABASE_SKIP_SOME_TABLES ||
+		!regex_include_list.empty() ||
+		tables_include_hash) {
+
+		/* Include lists are present, but qualified name
+		   failed to match any.*/
+		return(TRUE);
+	}
+
+	return(FALSE);
 }
 
 /***********************************************************************
@@ -3017,6 +3209,12 @@ xtrabackup_init_datasinks(void)
 	if (xtrabackup_encrypt) {
 		ds_ctxt_t	*ds;
 
+                ds_encrypt_algo = xtrabackup_encrypt_algo;
+                ds_encrypt_key = xtrabackup_encrypt_key;
+                ds_encrypt_key_file = xtrabackup_encrypt_key_file;
+                ds_encrypt_encrypt_threads = xtrabackup_encrypt_threads;
+                ds_encrypt_encrypt_chunk_size = xtrabackup_encrypt_chunk_size;
+
 		ds = ds_create(xtrabackup_target_dir, DS_TYPE_ENCRYPT);
 		xtrabackup_add_datasink(ds);
 
@@ -3345,7 +3543,10 @@ static
 void
 xb_register_filter_entry(
 /*=====================*/
-	const char*	name)	/*!< in: name */
+	const char*	name,	/*!< in: name */
+	hash_table_t** databases_hash,
+	hash_table_t** tables_hash
+	)
 {
 	const char*		p;
 	size_t			namelen;
@@ -3361,23 +3562,43 @@ xb_register_filter_entry(
 		strncpy(dbname, name, p - name);
 		dbname[p - name] = 0;
 
-		if (databases_hash) {
-			HASH_SEARCH(name_hash, databases_hash,
+		if (*databases_hash) {
+			HASH_SEARCH(name_hash, (*databases_hash),
 					ut_fold_string(dbname),
 					xb_filter_entry_t*,
 					db_entry, (void) 0,
 					!strcmp(db_entry->name, dbname));
 		}
 		if (!db_entry) {
-			db_entry = xb_add_filter(dbname, &databases_hash);
+			db_entry = xb_add_filter(dbname, databases_hash);
 		}
 		db_entry->has_tables = TRUE;
-		xb_add_filter(name, &tables_hash);
+		xb_add_filter(name, tables_hash);
 	} else {
 		xb_validate_name(name, namelen);
 
-		xb_add_filter(name, &databases_hash);
+		xb_add_filter(name, databases_hash);
 	}
+}
+
+static
+void
+xb_register_include_filter_entry(
+	const char* name
+)
+{
+	xb_register_filter_entry(name, &databases_include_hash,
+				 &tables_include_hash);
+}
+
+static
+void
+xb_register_exclude_filter_entry(
+	const char* name
+)
+{
+	xb_register_filter_entry(name, &databases_exclude_hash,
+				 &tables_exclude_hash);
 }
 
 /***********************************************************************
@@ -3393,33 +3614,61 @@ xb_register_table(
 		exit(EXIT_FAILURE);
 	}
 
-	xb_register_filter_entry(name);
+	xb_register_include_filter_entry(name);
 }
 
-/***********************************************************************
-Register new regex for the filter.  */
+static
+bool compile_regex(
+	const char* regex_string,
+	const char* error_context,
+	xb_regex_t* compiled_re)
+{
+	char	errbuf[100];
+	int	ret = xb_regcomp(compiled_re, regex_string, REG_EXTENDED);
+	if (ret != 0) {
+		xb_regerror(ret, compiled_re, errbuf, sizeof(errbuf));
+		msg("xtrabackup: error: %s regcomp(%s): %s\n",
+			error_context, regex_string, errbuf);
+		return false;
+	}
+	return true;
+}
+
 static
 void
-xb_register_regex(
-/*==============*/
-	const char* regex)	/*!< in: regex */
+xb_add_regex_to_list(
+	const char* regex,  /*!< in: regex */
+	const char* error_context,  /*!< in: context to error message */
+	regex_list_t* list) /*! in: list to put new regex to */
 {
-	xb_regex_list_node_t*	node;
-	char			errbuf[100];
-	int			ret;
-
-	node = static_cast<xb_regex_list_node_t *>
-		(ut_malloc(sizeof(xb_regex_list_node_t)));
-
-	ret = xb_regcomp(&node->regex, regex, REG_EXTENDED);
-	if (ret != 0) {
-		xb_regerror(ret, &node->regex, errbuf, sizeof(errbuf));
-		msg("xtrabackup: error: tables regcomp(%s): %s\n",
-			regex, errbuf);
+	xb_regex_t compiled_regex;
+	if (!compile_regex(regex, error_context, &compiled_regex)) {
 		exit(EXIT_FAILURE);
 	}
 
-	UT_LIST_ADD_LAST(regex_list, regex_list, node);
+	list->push_back(compiled_regex);
+}
+
+/***********************************************************************
+Register new regex for the include filter.  */
+static
+void
+xb_register_include_regex(
+/*==============*/
+	const char* regex)	/*!< in: regex */
+{
+	xb_add_regex_to_list(regex, "tables", &regex_include_list);
+}
+
+/***********************************************************************
+Register new regex for the exclude filter.  */
+static
+void
+xb_register_exclude_regex(
+/*==============*/
+	const char* regex)	/*!< in: regex */
+{
+	xb_add_regex_to_list(regex, "tables-exclude", &regex_exclude_list);
 }
 
 typedef void (*insert_entry_func_t)(const char*);
@@ -3485,25 +3734,33 @@ static
 void
 xb_filters_init()
 {
-	UT_LIST_INIT(regex_list);
-
 	if (xtrabackup_databases) {
 		xb_load_list_string(xtrabackup_databases, " \t",
-					xb_register_filter_entry);
+				    xb_register_include_filter_entry);
 	}
 
 	if (xtrabackup_databases_file) {
 		xb_load_list_file(xtrabackup_databases_file,
-					xb_register_filter_entry);
+				  xb_register_include_filter_entry);
+	}
+
+	if (xtrabackup_databases_exclude) {
+		xb_load_list_string(xtrabackup_databases_exclude, " \t",
+				    xb_register_exclude_filter_entry);
 	}
 
 	if (xtrabackup_tables) {
 		xb_load_list_string(xtrabackup_tables, ",",
-					xb_register_regex);
+				    xb_register_include_regex);
 	}
 
 	if (xtrabackup_tables_file) {
 		xb_load_list_file(xtrabackup_tables_file, xb_register_table);
+	}
+
+	if (xtrabackup_tables_exclude) {
+		xb_load_list_string(xtrabackup_tables_exclude, ",",
+				    xb_register_exclude_regex);
 	}
 }
 
@@ -3536,25 +3793,37 @@ xb_filter_hash_free(hash_table_t* hash)
 	hash_table_free(hash);
 }
 
+static void xb_regex_list_free(regex_list_t* list)
+{
+	while (list->size() > 0) {
+		xb_regfree(&list->front());
+		list->pop_front();
+	}
+}
+
 /************************************************************************
 Destroy table filters for partial backup. */
 static
 void
 xb_filters_free()
 {
-	while (UT_LIST_GET_LEN(regex_list) > 0) {
-		xb_regex_list_node_t*	node = UT_LIST_GET_FIRST(regex_list);
-		UT_LIST_REMOVE(regex_list, regex_list, node);
-		xb_regfree(&node->regex);
-		ut_free(node);
+	xb_regex_list_free(&regex_include_list);
+	xb_regex_list_free(&regex_exclude_list);
+
+	if (tables_include_hash) {
+		xb_filter_hash_free(tables_include_hash);
 	}
 
-	if (tables_hash) {
-		xb_filter_hash_free(tables_hash);
+	if (tables_exclude_hash) {
+		xb_filter_hash_free(tables_exclude_hash);
 	}
 
-	if (databases_hash) {
-		xb_filter_hash_free(databases_hash);
+	if (databases_include_hash) {
+		xb_filter_hash_free(databases_include_hash);
+	}
+
+	if (databases_exclude_hash) {
+		xb_filter_hash_free(databases_exclude_hash);
 	}
 }
 
@@ -3839,6 +4108,7 @@ xtrabackup_backup_func(void)
 	os_sync_mutex = NULL;
 	srv_general_init();
 	ut_crc32_init();
+	crc_init();
 
 	xb_filters_init();
 
@@ -4175,6 +4445,11 @@ skip_last_cp:
 		msg("xtrabackup: Error: failed to stream metadata.\n");
 		exit(EXIT_FAILURE);
 	}
+
+	if (!backup_finish()) {
+		exit(EXIT_FAILURE);
+	}
+
 	if (xtrabackup_extra_lsndir) {
 		char	filename[FN_REFLEN];
 
@@ -4186,10 +4461,14 @@ skip_last_cp:
 			exit(EXIT_FAILURE);
 		}
 
-	}
+		sprintf(filename, "%s/%s", xtrabackup_extra_lsndir,
+			XTRABACKUP_INFO);
+		if (!xtrabackup_write_info(filename)) {
+			msg("xtrabackup: Error: failed to write info "
+			    "to '%s'.\n", filename);
+			exit(EXIT_FAILURE);
+		}
 
-	if (!backup_finish()) {
-		exit(EXIT_FAILURE);
 	}
 
 	xtrabackup_destroy_datasinks();
@@ -5536,8 +5815,7 @@ next_file_item_1:
 		        goto next_datadir_item;
 		}
 
-		sprintf(dbpath, "%s/%s", path,
-								dbinfo.name);
+		fn_format(dbpath, dbinfo.name, path, "", MYF(0));
 		srv_normalize_path_for_win(dbpath);
 
 		dbdir = os_file_opendir(dbpath, FALSE);
@@ -5988,7 +6266,7 @@ xb_export_cfg_write(
 	file = fopen(file_path, "w+b");
 
 	if (file == NULL) {
-		msg("xtrabackup: Error: cannot close %s\n", node->name);
+		msg("xtrabackup: Error: cannot open %s\n", node->name);
 
 		success = false;
 	} else {
@@ -6218,13 +6496,13 @@ skip_check:
 	if (xtrabackup_compact) {
 		srv_compact_backup = TRUE;
 
-		if (!xb_expand_datafiles()) {
+		if (xtrabackup_compact_need_expand && !xb_expand_datafiles()) {
 			goto error_cleanup;
 		}
 
-		/* Reset the 'compact' flag in xtrabackup_checkpoints so we
+		/* Update 'compact' flag in xtrabackup_checkpoints so we
 		don't expand on subsequent invocations. */
-		xtrabackup_compact = FALSE;
+		xtrabackup_compact_need_expand = FALSE;
 		if (!xtrabackup_write_metadata(metadata_path)) {
 			msg("xtrabackup: error: xtrabackup_write_metadata() "
 			    "failed\n");
@@ -6451,17 +6729,20 @@ skip_check:
 				    table_name);
 				goto next_node;
 			}
-			index = dict_table_get_first_index(table);
-			n_index = UT_LIST_GET_LEN(table->indexes);
-			if (n_index > 31) {
-				msg("xtrabackup: error: "
-				    "sorry, cannot export over "
-				    "31 indexes for now.\n");
-				goto next_node;
-			}
 
 			/* Write MySQL 5.6 .cfg file */
 			if (!xb_export_cfg_write(node, table)) {
+				goto next_node;
+			}
+
+			index = dict_table_get_first_index(table);
+			n_index = UT_LIST_GET_LEN(table->indexes);
+			if (n_index > 31) {
+				msg("xtrabackup: warning: table '%s' has more "
+				    "than 31 indexes, .exp file was not "
+				    "generated. Table will fail to import "
+				    "on server version prior to 5.6.\n",
+				    table->name);
 				goto next_node;
 			}
 
@@ -6639,6 +6920,12 @@ next_node:
 
 	if (!xtrabackup_apply_log_only) {
 
+		/* xtrabackup_incremental_dir is used to indicate that
+		we are going to apply incremental backup. Here we already
+		applied incremental backup and are about to do final prepare
+		of the full backup */
+		xtrabackup_incremental_dir = NULL;
+
 		if(innodb_init_param()) {
 			goto error;
 		}
@@ -6779,9 +7066,11 @@ xb_init()
 
 	if (xtrabackup_backup) {
 
+#ifdef HAVE_VERSION_CHECK
 		if (!opt_noversioncheck) {
 			version_check();
 		}
+#endif
 
 		if ((mysql_connection = xb_mysql_connect()) == NULL) {
 			return(false);
@@ -6791,11 +7080,233 @@ xb_init()
 			return(false);
 		}
 
+		if (opt_check_privileges) {
+			check_all_privileges();
+		}
+
 		history_start_time = time(NULL);
 
 	}
 
 	return(true);
+}
+
+static const char*
+normalize_privilege_target_name(const char* name)
+{
+	if (strcmp(name, "*") == 0) {
+		return "\\*";
+	} else {
+		/* should have no regex special characters. */
+		ut_ad(strpbrk(name, ".()[]*+?") == 0);
+	}
+	return name;
+}
+
+/******************************************************************//**
+Check if specific privilege is granted.
+Uses regexp magic to check if requested privilege is granted for given
+database.table or database.* or *.*
+or if user has 'ALL PRIVILEGES' granted.
+@return true if requested privilege is granted, false otherwise. */
+static bool
+has_privilege(const std::list<std::string> &granted,
+	const char* required,
+	const char* db_name,
+	const char* table_name)
+{
+	char buffer[1000];
+	xb_regex_t priv_re;
+	xb_regmatch_t tables_regmatch[1];
+	bool result = false;
+
+	db_name = normalize_privilege_target_name(db_name);
+	table_name = normalize_privilege_target_name(table_name);
+
+	int written = snprintf(buffer, sizeof(buffer),
+		"GRANT .*(%s)|(ALL PRIVILEGES).* ON (\\*|`%s`)\\.(\\*|`%s`)",
+		required, db_name, table_name);
+	if (written < 0 || written == sizeof(buffer)
+		|| !compile_regex(buffer, "has_privilege", &priv_re)) {
+		exit(EXIT_FAILURE);
+	}
+
+	typedef std::list<std::string>::const_iterator string_iter;
+	for (string_iter i = granted.begin(), e = granted.end(); i != e; ++i) {
+		int res = xb_regexec(&priv_re, i->c_str(),
+			1, tables_regmatch, 0);
+
+		if (res != REG_NOMATCH) {
+			result = true;
+			break;
+		}
+	}
+
+	xb_regfree(&priv_re);
+	return result;
+}
+
+enum {
+	PRIVILEGE_OK = 0,
+	PRIVILEGE_WARNING = 1,
+	PRIVILEGE_ERROR = 2,
+};
+
+/******************************************************************//**
+Check if specific privilege is granted.
+Prints error message if required privilege is missing.
+@return PRIVILEGE_OK if requested privilege is granted, error otherwise. */
+static
+int check_privilege(
+	const std::list<std::string> &granted_priv, /* in: list of
+							granted privileges*/
+	const char* required,		/* in: required privilege name */
+	const char* target_database,	/* in: required privilege target
+						database name */
+	const char* target_table,	/* in: required privilege target
+						table name */
+	int error = PRIVILEGE_ERROR)	/* in: return value if privilege
+						is not granted */
+{
+	if (!has_privilege(granted_priv,
+		required, target_database, target_table)) {
+		msg("xtrabackup: %s: missing required privilege %s on %s.%s\n",
+			(error == PRIVILEGE_ERROR ? "Error" : "Warning"),
+			required, target_database, target_table);
+		return error;
+	}
+	return PRIVILEGE_OK;
+}
+
+/******************************************************************//**
+Check DB user privileges according to the intended actions.
+
+Fetches DB user privileges, determines intended actions based on
+command-line arguments and prints missing privileges.
+May terminate application with EXIT_FAILURE exit code.*/
+static void
+check_all_privileges()
+{
+	if (!mysql_connection) {
+		/* Not connected, no queries is going to be executed. */
+		return;
+	}
+
+	/* Fetch effective privileges. */
+	std::list<std::string> granted_privileges;
+	MYSQL_ROW row = 0;
+	MYSQL_RES* result = xb_mysql_query(mysql_connection, "SHOW GRANTS",
+		true);
+	while((row = mysql_fetch_row(result))) {
+		granted_privileges.push_back(*row);
+	}
+	mysql_free_result(result);
+
+	int check_result = PRIVILEGE_OK;
+	bool reload_checked = false;
+
+	/* SHOW DATABASES */
+	check_result |= check_privilege(granted_privileges,
+		"SHOW DATABASES", "*", "*");
+
+	/* SELECT 'INNODB_CHANGED_PAGES', COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS */
+	check_result |= check_privilege(
+		granted_privileges,
+		"SELECT", "INFORMATION_SCHEMA", "PLUGINS");
+
+
+	if (xb_mysql_numrows(mysql_connection,
+		"SHOW DATABASES LIKE 'PERCONA_SCHEMA';",
+		false) == 0) {
+		/* CREATE DATABASE IF NOT EXISTS PERCONA_SCHEMA */
+		check_result |= check_privilege(
+			granted_privileges,
+			"CREATE", "*", "*");
+	} else if (xb_mysql_numrows(mysql_connection,
+		"SHOW TABLES IN PERCONA_SCHEMA "
+		"LIKE 'xtrabackup_history';",
+		false) == 0) {
+		/* CREATE TABLE IF NOT EXISTS PERCONA_SCHEMA.xtrabackup_history */
+		check_result |= check_privilege(
+			granted_privileges,
+			"CREATE", "PERCONA_SCHEMA", "*");
+	}
+
+	/* FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS */
+	if (have_flush_engine_logs
+		/* FLUSH NO_WRITE_TO_BINLOG TABLES */
+		|| (opt_lock_wait_timeout && !opt_kill_long_queries_timeout
+			&& !opt_no_lock)
+		/* FLUSH TABLES WITH READ LOCK */
+		|| !opt_no_lock
+		/* LOCK BINLOG FOR BACKUP */
+		/* UNLOCK BINLOG */
+		|| (have_backup_locks && !opt_no_lock)) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"RELOAD", "*", "*");
+		reload_checked = true;
+	}
+
+
+	/* FLUSH TABLES WITH READ LOCK */
+	if (!opt_no_lock
+		/* LOCK TABLES FOR BACKUP */
+		/* UNLOCK TABLES */
+		&& ((have_backup_locks && !opt_no_lock) || opt_slave_info
+		|| opt_binlog_info == BINLOG_INFO_ON)) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"LOCK TABLES", "*", "*");
+	}
+
+	/* SELECT innodb_to_lsn FROM PERCONA_SCHEMA.xtrabackup_history ... */
+	if (opt_incremental_history_name || opt_incremental_history_uuid) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"SELECT", "PERCONA_SCHEMA", "xtrabackup_history");
+	}
+
+	/* SHOW FULL PROCESSLIST */
+	if (opt_lock_wait_timeout || opt_kill_long_queries_timeout) {
+		check_result |= check_privilege(granted_privileges,
+			"PROCESS", "*", "*");
+	}
+
+	if (!reload_checked
+		/* FLUSH BINARY LOGS */
+		&& opt_galera_info) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"RELOAD", "*", "*",
+			PRIVILEGE_WARNING);
+	}
+
+	/* KILL ... */
+	if (opt_kill_long_queries_timeout
+		/* START SLAVE SQL_THREAD */
+		/* STOP SLAVE SQL_THREAD */
+		|| opt_safe_slave_backup) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"SUPER", "*", "*",
+			PRIVILEGE_WARNING);
+	}
+
+	/* SHOW MASTER STATUS */
+	/* SHOW SLAVE STATUS */
+	if (opt_galera_info || opt_slave_info
+		|| (opt_no_lock && opt_safe_slave_backup)
+		/* LOCK BINLOG FOR BACKUP */
+		|| (have_backup_locks && !opt_no_lock)) {
+		check_result |= check_privilege(granted_privileges,
+			"REPLICATION CLIENT", "*", "*",
+			PRIVILEGE_WARNING);
+	}
+
+	if (check_result & PRIVILEGE_ERROR) {
+		exit(EXIT_FAILURE);
+	}
 }
 
 void
@@ -6908,6 +7419,9 @@ handle_options(int argc, char **argv, char ***argv_client, char ***argv_server)
 					xb_server_options, xb_get_one_option)))
 		exit(ho_error);
 
+	msg("xtrabackup: recognized server arguments: %s\n", param_str.str().c_str());
+	param_str.clear();
+
 	if (load_defaults(conf_file, xb_client_default_groups,
 			  &argc_client, argv_client)) {
 		exit(EXIT_FAILURE);
@@ -6926,6 +7440,9 @@ handle_options(int argc, char **argv, char ***argv_client, char ***argv_server)
 	    && (ho_error=handle_options(&argc_client, argv_client,
 					xb_client_options, xb_get_one_option)))
 		exit(ho_error);
+
+	msg("xtrabackup: recognized client arguments: %s\n", param_str.str().c_str());
+	param_str.clear();
 
 	/* Reject command line arguments that don't look like options, i.e. are
 	not of the form '-X' (single-character options) or '--option' (long
@@ -7151,6 +7668,11 @@ int main(int argc, char **argv)
 		msg("xtrabackup: warning: "
 		    "as --innodb-log-arch-dir and --to-archived-lsn can be used "
 		    "only with --prepare they will be reset\n");
+	}
+	if (xtrabackup_throttle && !xtrabackup_backup) {
+		xtrabackup_throttle = 0;
+		msg("xtrabackup: warning: --throttle has effect "
+		    "only with --backup\n");
 	}
 
 	/* cannot execute both for now */

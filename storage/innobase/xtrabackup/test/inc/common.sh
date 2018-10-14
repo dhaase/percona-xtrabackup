@@ -461,25 +461,74 @@ function force_checkpoint()
 ########################################################################
 # Configure a specified server as a slave
 # Synopsis:
-#   setup_slave <slave_id> <master_id>
+#   setup_slave [GTID] [USE_CHANNELS] <slave_id> <master_id> ... <master_id>
 #########################################################################
 function setup_slave()
 {
-    local slave_id=$1
-    local master_id=$2
+    local extra=""
+    if [ "$1" == "GTID" ]
+    then
+        extra=", MASTER_AUTO_POSITION = 1"
+        shift
+        echo "Setting up slave in GTID mode"
+    fi
 
-    vlog "Setting up server #$slave_id as a slave of server #$master_id"
+    local use_channels=0
+    if [ "$1" == "USE_CHANNELS" ]
+    then
+        use_channels=1
+        shift
+        echo "Using channels"
+    fi
 
-    switch_server $slave_id
+    local -r slave_id_arg=$1
+    shift
 
-    run_cmd $MYSQL $MYSQL_ARGS <<EOF
+    switch_server $slave_id_arg
+    mysql -e "STOP SLAVE"
+    while [ "$#" -ne 0 ]
+    do
+        local master_id_arg=$1
+        shift
+
+        vlog "Setting up server #$slave_id_arg as a slave of server #$master_id_arg"
+        if [ "$use_channels" -eq 1 ]
+        then
+            local master_channel="FOR CHANNEL 'master-$master_id_arg'"
+        fi
+
+        run_cmd $MYSQL $MYSQL_ARGS <<EOF
 CHANGE MASTER TO
   MASTER_HOST='localhost',
   MASTER_USER='root',
-  MASTER_PORT=${SRV_MYSQLD_PORT[$master_id]};
-
-START SLAVE
+  MASTER_PORT=${SRV_MYSQLD_PORT[$master_id_arg]}
+  $extra
+  ${master_channel:-};
 EOF
+    done
+
+    mysql -e "START SLAVE"
+}
+
+########################################################################
+# Get executed gtid set from SHOW MASTER STATUS
+########################################################################
+function get_gtid_executed()
+{
+    local count
+    local res
+
+    count=0
+    while read line; do
+        if [ $count -eq 5 ] # File:
+        then
+            res=`echo "$line" | sed s/Executed_Gtid_Set://`
+            break;
+        fi
+        count=$((count+1))
+    done <<< "`run_cmd $MYSQL $MYSQL_ARGS -Nse 'SHOW MASTER STATUS\G' mysql`"
+
+    echo $res
 }
 
 ########################################################################
@@ -848,6 +897,28 @@ function has_status_variable()
 }
 
 ########################################################################
+# Return 0 if the server has specified variable turned ON
+########################################################################
+function is_variable_on()
+{
+    local var=$1
+
+    if $MYSQL $MYSQL_ARGS -s -e "SHOW VARIABLES LIKE '$var'\G" \
+              2> /dev/null | egrep -q "Value: ON"
+    then
+        return 0
+    fi
+
+    # Was the server available?
+    if [[ ${PIPESTATUS[0]} != 0 ]]
+    then
+        die "Server is unavailable"
+    fi
+
+    return 1
+}
+
+########################################################################
 # Return 0 if the server has backup locks support
 ########################################################################
 function has_backup_locks()
@@ -869,6 +940,14 @@ function has_backup_safe_binlog_info()
 function has_openssl()
 {
     has_status_variable "Rsa_public_key"
+}
+
+########################################################################
+# Return 0 if the server has been compiled with OpenSSL
+########################################################################
+function is_gtid_mode()
+{
+    is_variable_on "gtid_mode"
 }
 
 # Return 0 if the platform is 64-bit

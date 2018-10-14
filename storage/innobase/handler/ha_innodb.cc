@@ -1612,7 +1612,15 @@ innobase_get_cset_width(
 			}
 		} else {
 
-			ut_a(cset == 0);
+			if (cset != 0) {
+				/* Since we don't do anything fancy with the
+				data itself, it is safe to ignore missing
+				collation. (special case for collation that
+				isn't supported in vanilla MySQL) */
+				ib_logf(IB_LOG_LEVEL_WARN,
+					"Unknown collation #%lu.",
+					cset);
+			}
 		}
 
 		*mbminlen = *mbmaxlen = 0;
@@ -9444,6 +9452,7 @@ index_bad:
 			thd, Sql_condition::WARN_LEVEL_WARN,
 			ER_ILLEGAL_HA_CREATE_OPTION,
 			"InnoDB: assuming ROW_FORMAT=COMPACT.");
+		// Fall through.
 	case ROW_TYPE_DEFAULT:
 		/* If we fell through, set row format to Compact. */
 		row_format = ROW_TYPE_COMPACT;

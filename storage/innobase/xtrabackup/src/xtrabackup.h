@@ -25,6 +25,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include "datasink.h"
 #include "xbstream.h"
 #include "changed_page_bitmap.h"
+#include "xtrabackup_config.h"
 
 #ifdef __WIN__
 #define XB_FILE_UNDEFINED NULL
@@ -79,6 +80,8 @@ extern char		*xtrabackup_tables;
 extern char		*xtrabackup_tables_file;
 extern char		*xtrabackup_databases;
 extern char		*xtrabackup_databases_file;
+extern char		*xtrabackup_tables_exclude;
+extern char		*xtrabackup_databases_exclude;
 
 extern my_bool		xtrabackup_compact;
 extern ibool		xtrabackup_compress;
@@ -127,7 +130,9 @@ extern my_bool		opt_no_lock;
 extern my_bool		opt_safe_slave_backup;
 extern my_bool		opt_rsync;
 extern my_bool		opt_force_non_empty_dirs;
+#ifdef HAVE_VERSION_CHECK
 extern my_bool		opt_noversioncheck;
+#endif
 extern my_bool		opt_no_backup_locks;
 extern my_bool		opt_decompress;
 extern my_bool		opt_remove_original;
@@ -164,6 +169,8 @@ extern uint		opt_safe_slave_backup_timeout;
 
 extern const char	*opt_history;
 extern my_bool		opt_decrypt;
+
+extern uint		opt_read_buffer_size;
 
 #if defined(HAVE_OPENSSL)
 extern my_bool opt_use_ssl;
@@ -210,6 +217,17 @@ my_bool
 check_if_skip_table(
 /******************/
 	const char*	name);	/*!< in: path to the table */
+
+
+/************************************************************************
+Checks if a database specified by path should be skipped from backup based on
+the --databases, --databases_file or --databases_exclude options.
+
+@return TRUE if the table should be skipped. */
+my_bool
+check_if_skip_database_by_path(
+	const char* path /*!< in: path to the db directory. */
+);
 
 /************************************************************************
 Check if parameter is set in defaults file or via command line argument

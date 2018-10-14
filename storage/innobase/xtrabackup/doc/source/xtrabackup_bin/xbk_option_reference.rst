@@ -29,6 +29,20 @@ Options
    ``OFF``, ``ON``, ``LOCKLESS`` and ``AUTO``. See the |Percona XtraBackup|
    :ref:`lockless_bin-log`  manual page for more information.
 
+.. option:: --check-privileges
+
+   This option checks if |Percona XtraBackup| has all required privileges.
+   If a missing privilege is required for the current operation,
+   it will terminate and print out an error message.
+   If a missing privilege is not required for the current operation,
+   but may be necessary for some other XtraBackup operation,
+   the process is not aborted and a warning is printed.
+
+   .. code-block:: bash
+
+     xtrabackup: Error: missing required privilege LOCK TABLES on *.*
+     xtrabackup: Warning: missing required privilege REPLICATION CLIENT on *.*
+
 .. option:: --close-files
 
    Do not keep files opened. When |xtrabackup| opens tablespace it normally
@@ -83,6 +97,13 @@ Options
    This option specifies the list of databases and tables that should be backed
    up. The option accepts the list of the form ``"databasename1[.table_name1]
    databasename2[.table_name2] . . ."``.
+
+.. option::  --databases-exclude=name
+
+   Excluding databases based on name, Operates the same way
+   as :option:`xtrabackup --databases`, but matched names are excluded from
+   backup. Note that this option has a higher priority than
+   :option:`xtrabackup --databases`.
 
 .. option:: --databases-file=#
 
@@ -159,7 +180,7 @@ Options
 .. option:: --encrypt-threads=#
 
    This option specifies the number of worker threads that will be used for
-   parallel encryption. It is passed directly to the xtrabackup child process.
+   parallel encryption/decryption.
    See the :program:`xtrabackup` :doc:`documentation
    <../xtrabackup_bin/xtrabackup_binary>` for more details.
 
@@ -178,7 +199,7 @@ Options
 .. option:: --extra-lsndir=DIRECTORY
 
    (for --backup): save an extra copy of the :file:`xtrabackup_checkpoints`
-   file in this directory.
+   and :file:`xtrabackup_info` files in this directory.
 
 .. option:: --force-non-empty-directories
 
@@ -282,7 +303,10 @@ Options
 
    This option specifies the number of threads to use to copy multiple data
    files concurrently when creating a backup. The default value is 1 (i.e., no
-   concurrent transfer).
+   concurrent transfer). In |Percona XtraBackup| 2.3.10 and newer, this option
+   can be used with :option:`xtrabackup --copy-back` option to copy the user
+   data files in parallel (redo logs and system tablespaces are copied in the
+   main thread).
 
 .. option:: --password=PASSWORD
 
@@ -433,6 +457,13 @@ Options
    A regular expression against which the full tablename, in
    ``databasename.tablename`` format, is matched. If the name matches, the
    table is backed up. See :doc:`partial backups <partial_backups>`.
+
+.. option:: --tables-exclude=name
+
+   Filtering by regexp for table names. Operates the same
+   way as :option:`xtrabackup --tables`, but matched names are excluded from
+   backup. Note that this option has a higher priority than
+   :option:`xtrabackup --tables`.
 
 .. option:: --tables-file=name
 
